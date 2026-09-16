@@ -37,7 +37,8 @@ class Bucket:
         # 3. Store the returned asynchronous work handle in `self.handle`.                 #
         ####################################################################################
         
-        raise NotImplementedError
+        self.grad_data.div_(self.process_group_size)
+        self.handle = dist.all_reduce(self.grad_data, group=self.process_group, async_op=True)
 
         ####################################################################################
         #                            END of Implementation.                                #

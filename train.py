@@ -7,6 +7,7 @@ import inspect
 import json
 import time
 import datetime
+import contextlib
 import argparse
 import torch.nn.functional as F
 import torch, torch.distributed as dist
@@ -25,6 +26,110 @@ from picotron.data_parallel.data_parallel import DataParallelBucket,DataParallel
 from picotron.model import Llama
 import wandb
 from picotron.utils import debug_test
+
+GIB = 1024 ** 3
+
+
+def _storage_key(tensor):
+    """Return an identifier for a tensor's backing storage."""
+    storage = tensor.untyped_storage()
+    return (tensor.device.type, tensor.device.index, storage.data_ptr(), storage.nbytes())
+
+
+def _unique_tensor_bytes(tensors, device):
+    """Count tensor storage bytes once, even when tensors are views."""
+    storages = {}
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor) or tensor.device != device:
+            continue
+        key = _storage_key(tensor)
+        storages[key] = key[-1]
+    return sum(storages.values())
+
+
+def _optimizer_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _optimizer_tensors(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _optimizer_tensors(item)
+
+
+def get_memory_components(model, optimizer, activation_bytes, device):
+    parameters = list(model.parameters())
+    gradients = []
+    for parameter in parameters:
+        if parameter.grad is not None:
+            gradients.append(parameter.grad)
+        main_grad = getattr(parameter, "main_grad", None)
+        if main_grad is not None:
+            gradients.append(main_grad)
+
+    return {
+        "parameter_memory": _unique_tensor_bytes(parameters, device),
+        "gradient_memory": _unique_tensor_bytes(gradients, device),
+        "optimizer_state_memory": _unique_tensor_bytes(
+            _optimizer_tensors(optimizer.state), device
+        ),
+        "activation_memory": activation_bytes,
+        "peak_gpu_memory": (
+            torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+        ),
+    }
+
+
+def max_memory_components_across_ranks(components, device):
+    values = torch.tensor(
+        list(components.values()), dtype=torch.int64, device=device
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    return dict(zip(components, values.tolist()))
+
+
+class SavedActivationMemory:
+    """Track peak storage held by tensors saved for backward."""
+
+    def __init__(self, model, device):
+        self.device = device
+        self.parameter_storages = {
+            _storage_key(parameter)
+            for parameter in model.parameters()
+            if parameter.device == device
+        }
+        self.live_storages = {}
+        self.current_bytes = 0
+        self.peak_bytes = 0
+
+    def pack(self, tensor):
+        if tensor.device != self.device:
+            return tensor
+        key = _storage_key(tensor)
+        if key in self.parameter_storages:
+            return tensor
+        count = self.live_storages.get(key, 0)
+        self.live_storages[key] = count + 1
+        if count == 0:
+            self.current_bytes += key[-1]
+            self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+        return tensor
+
+    def unpack(self, tensor):
+        if tensor.device != self.device:
+            return tensor
+        key = _storage_key(tensor)
+        count = self.live_storages.get(key)
+        if count is None:
+            return tensor
+        if count == 1:
+            self.current_bytes -= key[-1]
+            del self.live_storages[key]
+        else:
+            self.live_storages[key] = count - 1
+        return tensor
+
 
 def train_step(model, data_loader, device):
     acc_loss = 0.0
@@ -247,8 +352,19 @@ if __name__ == "__main__":
         use_fused = fused_available and device == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
 
-    optimizer = AdamW(model.parameters(), lr=config["training"]["learning_rate"], **extra_args)
+    # AdamW optimizer
+    # optimizer = AdamW(model.parameters(), lr=config["training"]["learning_rate"], **extra_args)
     
+    # SGD optimizer
+    optimizer = SGD(model.parameters(), lr=config["training"]["learning_rate"], **extra_args)
+
+    # SGD optimizer with momentum
+    # optimizer = SGD(
+    #     model.parameters(),
+    #     lr=config["training"]["learning_rate"],
+    #     momentum=config["training"].get("momentum", 0.9),
+    # )
+
     checkpoint_manager = CheckpointManager()
 
     trained_tokens, step = 0, 0
@@ -268,16 +384,27 @@ if __name__ == "__main__":
                 step_start_time = time.perf_counter()
 
         optimizer.zero_grad()
-        
-        if pgm.process_group_manager.pp_world_size > 1:
-            if config["distributed"]["pp_engine"] == "afab":
-                loss = train_step_pipeline_afab(model, data_loader, tensor_shapes, device, dtype)
-            elif config["distributed"]["pp_engine"] == "1f1b":
-                loss = train_step_pipeline_1f1b(model, data_loader, tensor_shapes, device, dtype)
+        activation_tracker = SavedActivationMemory(model, device) if should_log else None
+        if should_log and device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
+        activation_context = (
+            torch.autograd.graph.saved_tensors_hooks(
+                activation_tracker.pack, activation_tracker.unpack
+            )
+            if activation_tracker is not None
+            else contextlib.nullcontext()
+        )
+        with activation_context:
+            if pgm.process_group_manager.pp_world_size > 1:
+                if config["distributed"]["pp_engine"] == "afab":
+                    loss = train_step_pipeline_afab(model, data_loader, tensor_shapes, device, dtype)
+                elif config["distributed"]["pp_engine"] == "1f1b":
+                    loss = train_step_pipeline_1f1b(model, data_loader, tensor_shapes, device, dtype)
+                else:
+                    raise ValueError(f"Invalid pipeline parallel engine: {config['distributed']['pp_engine']}")
             else:
-                raise ValueError(f"Invalid pipeline parallel engine: {config['distributed']['pp_engine']}")
-        else:
-            loss = train_step(model, data_loader, device)
+                loss = train_step(model, data_loader, device)
             
         loss = average_loss_across_dp_cp_ranks(loss, device)
         
@@ -287,6 +414,14 @@ if __name__ == "__main__":
         
         if hasattr(model, 'reset'):
             model.reset()
+
+        if should_log:
+            memory_components = get_memory_components(
+                model, optimizer, activation_tracker.peak_bytes, device
+            )
+            memory_components = max_memory_components_across_ranks(
+                memory_components, device
+            )
 
         if is_wandb_rank and should_log:
             if device.type == "cuda":
@@ -310,19 +445,27 @@ if __name__ == "__main__":
                 f"Tokens/s/GPU: {to_readable_format(tokens_per_second_per_gpu):>7s} | "
                 f"Tokens: {to_readable_format(trained_tokens):>7s}{('/' + to_readable_format(config['training']['max_tokens'])) if config['training']['max_tokens'] else ''} | "
                 f"MFU: {mfu:5.2f}% | "
-                f"Memory usage: {torch.cuda.memory_reserved() / 1e9:6.2f}GB",
+                f"Parameter memory: {memory_components['parameter_memory'] / GIB:6.2f}GiB | "
+                f"Gradient memory: {memory_components['gradient_memory'] / GIB:6.2f}GiB | "
+                f"Optimizer-state memory: {memory_components['optimizer_state_memory'] / GIB:6.2f}GiB | "
+                f"Activation memory: {memory_components['activation_memory'] / GIB:6.2f}GiB | "
+                f"Peak GPU memory: {memory_components['peak_gpu_memory'] / GIB:6.2f}GiB",
                 is_print_rank=is_wandb_rank
             )
         
             if config["logging"]["use_wandb"]:
                 wandb.log({
                     "loss": loss,
+                    "num_parameters": num_params,
                     "step_duration_ms": step_duration_ms,
                     "tokens_per_step": tokens_per_step,
                     "tokens_per_second": tokens_per_second,
                     "mfu": mfu,
                     "tokens_per_second_per_gpu": tokens_per_second_per_gpu,
-                    "memory_usage": torch.cuda.memory_reserved() / 1e9,
+                    **{
+                        name: value / GIB
+                        for name, value in memory_components.items()
+                    },
                     "trained_tokens": trained_tokens
                 })
         
