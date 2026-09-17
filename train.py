@@ -333,8 +333,10 @@ if __name__ == "__main__":
 
     # patch for gradient sync so that devices in the cp_dp_group will sync gradients
     if pgm.process_group_manager.cp_dp_world_size > 1:
-        model = DataParallelBucket(model)
+        # model = DataParallelBucket(model)
+        model = DataParallelNaive(model)
     
+
     print(f"init model parallel time: {time.time()-start_time:.2f}s", is_print_rank=is_wandb_rank)
     
     model.train()

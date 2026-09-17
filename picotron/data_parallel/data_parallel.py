@@ -38,15 +38,17 @@ class DataParallelNaive(nn.Module):
             if p.requires_grad is True:
                 p.register_post_accumulate_grad_hook(hook)
                 
-    def _allreduce_grads(self, grad):
+    def _allreduce_grads(self, param):
         """
-        Performs an all-reduce operation to synchronize gradients across multiple processes.    
+        Performs an all-reduce operation to synchronize gradients across multiple processes.
+
+        Note: `register_post_accumulate_grad_hook` passes the *parameter* (not its gradient),
+        so the gradient must be accessed via `param.grad`.
         """
         # No synchronization needed during gradient accumulation, except at the final accumulation step.
         if self.require_backward_grad_sync:
-            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=pgm.process_group_manager.cp_dp_group)
-            grad /= pgm.process_group_manager.cp_dp_world_size
-        return grad 
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=pgm.process_group_manager.cp_dp_group)
+            param.grad.div_(pgm.process_group_manager.cp_dp_world_size)
     
     @contextlib.contextmanager
     def no_sync(self):
