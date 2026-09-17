@@ -230,6 +230,9 @@ if __name__ == "__main__":
         dp_size=config["distributed"]["dp_size"]
     )
     is_wandb_rank = pgm.process_group_manager.tp_rank == 0 and pgm.process_group_manager.dp_rank == 0 and pgm.process_group_manager.cp_rank == 0 and pgm.process_group_manager.pp_is_last_stage
+    # When enabled, every rank prints its own step line with its local (per-GPU) memory numbers.
+    log_all_ranks = config["logging"].get("log_all_ranks", False)
+    is_log_rank = is_wandb_rank or log_all_ranks
 
     set_all_seed(config["training"]["seed"])
 
@@ -377,7 +380,7 @@ if __name__ == "__main__":
     
     while config["training"]["max_tokens"] is None or trained_tokens < config["training"]["max_tokens"]:
         should_log = (step + 1) % log_frequency == 0
-        if is_wandb_rank and should_log:
+        if is_log_rank and should_log:
             if device.type == "cuda":
                 step_start_event = torch.cuda.Event(enable_timing=True)
                 step_end_event = torch.cuda.Event(enable_timing=True)
@@ -418,14 +421,16 @@ if __name__ == "__main__":
             model.reset()
 
         if should_log:
-            memory_components = get_memory_components(
+            # Local (per-GPU) numbers are printed by each logging rank; the cross-rank
+            # max is what gets sent to wandb. All ranks must participate in the reduce.
+            local_memory = get_memory_components(
                 model, optimizer, activation_tracker.peak_bytes, device
             )
             memory_components = max_memory_components_across_ranks(
-                memory_components, device
+                local_memory, device
             )
 
-        if is_wandb_rank and should_log:
+        if is_log_rank and should_log:
             if device.type == "cuda":
                 step_end_event.record()
                 step_end_event.synchronize()
@@ -447,15 +452,15 @@ if __name__ == "__main__":
                 f"Tokens/s/GPU: {to_readable_format(tokens_per_second_per_gpu):>7s} | "
                 f"Tokens: {to_readable_format(trained_tokens):>7s}{('/' + to_readable_format(config['training']['max_tokens'])) if config['training']['max_tokens'] else ''} | "
                 f"MFU: {mfu:5.2f}% | "
-                f"Parameter memory: {memory_components['parameter_memory'] / GIB:6.2f}GiB | "
-                f"Gradient memory: {memory_components['gradient_memory'] / GIB:6.2f}GiB | "
-                f"Optimizer-state memory: {memory_components['optimizer_state_memory'] / GIB:6.2f}GiB | "
-                f"Activation memory: {memory_components['activation_memory'] / GIB:6.2f}GiB | "
-                f"Peak GPU memory: {memory_components['peak_gpu_memory'] / GIB:6.2f}GiB",
-                is_print_rank=is_wandb_rank
+                f"Parameter memory: {local_memory['parameter_memory'] / GIB:6.2f}GiB | "
+                f"Gradient memory: {local_memory['gradient_memory'] / GIB:6.2f}GiB | "
+                f"Optimizer-state memory: {local_memory['optimizer_state_memory'] / GIB:6.2f}GiB | "
+                f"Activation memory: {local_memory['activation_memory'] / GIB:6.2f}GiB | "
+                f"Peak GPU memory: {local_memory['peak_gpu_memory'] / GIB:6.2f}GiB",
+                is_print_rank=is_log_rank
             )
         
-            if config["logging"]["use_wandb"]:
+            if is_wandb_rank and config["logging"]["use_wandb"]:
                 wandb.log({
                     "loss": loss,
                     "num_parameters": num_params,

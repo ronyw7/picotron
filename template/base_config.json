@@ -48,7 +48,8 @@
         "use_wandb": false,
         "project_name": "picotron",
         "run_name": null,
-        "log_frequency": 1
+        "log_frequency": 1,
+        "log_all_ranks": true
     },
     "environment": {
         "OMP_NUM_THREADS": "1",
